@@ -1,0 +1,2081 @@
+#!/usr/bin/env python3
+"""n1os - fast inference for the latest open-source models, on your own GPU(s).
+
+The engine is Strata plus Maya, and it is model-agnostic: a family is a runner plus its quants (FAMILIES).
+The installer serves the GLM family today. Launch hardware is RTX 3090 clusters; the GPUs Strata and the GLM
+path already run stay supported.
+CUDA: Linux; Windows (experimental). HIP: experimental Linux gfx1100/gfx1201/gfx1151, text only.
+
+    ./n1os.sh                 the first run sets everything up and starts the dashboard; later runs just start it
+    ./n1os.sh --setup         set up again (other GPUs, another context length, another model folder)
+    ./n1os.sh --check         only check this PC
+    ./n1os.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 7
+
+On Windows START-N1OS.bat takes the same options.  Both make the private Python environment (.venv, the way Strata's
+setup.sh does) and run this file.  It reuses Strata's installer (setup.py) for the PC checks,
+pip, llama.cpp's source and resumable downloads.
+
+What the first run does (each step is skipped when it is already done):
+
+  1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+, driver, CUDA toolkit (nvcc), the C++ compiler (g++;
+     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+  2. asks: which GPUs (one, or several that split the layers), how much context, which model to download. The quant
+     and the context follow the GPUs: the largest one that keeps most of its experts in VRAM (Maya-S24 on one to
+     three 24 GB cards, Maya-S on about four, Maya-M on about five, GSQ-RCO 3.5-bit on about six or more)
+  3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
+  4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
+  5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
+     and the size - and starts only after you answer y (or pass --download-model)
+  6. builds the pack (the engine's index of the GGUF files) inside the model folder
+  7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
+     (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
+  8. writes n1os-<model>.json and run-n1os-<model>.sh (.bat on Windows) - with the settings tuned for this PC
+     earlier, or it offers the tuning (./n1os.sh --calibrate does it any time) - and starts the dashboard on
+     http://127.0.0.1:8080
+
+The tuning (tools/calibrate_glm.py, like Strata's --calibrate): decode speed measured with a few splits of the RAM-tier
+experts between the CPU and the PCIe link, and with fewer CPU threads, in one engine run (~10-15 minutes, the model
+loads first); a setting is kept when it is more than 3% faster than the engine's own choice.  The result goes into the
+config's "env" (STRATA_GLM_PCIE_SHARE, STRATA_GLM_CPU_LANE) and into ~/.config/n1os/calibration.json for this
+PC, model and context, so a setup again keeps it.
+
+Nothing is installed system-wide: a missing tool is reported with the command that installs it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / "tools"))
+import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
+from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
+import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./n1os.sh --calibrate)
+
+WIN = S.WIN
+ME = "START-N1OS.bat" if WIN else "./n1os.sh"      # how this is started, for the messages
+ROOT = S.ROOT
+BUILD = ROOT / "build"
+EXE = BUILD / ("strata.exe" if WIN else "strata")
+STAMP = BUILD / "N1OS-BUILD.json"                  # what the engine in build/ was compiled from and for
+VBUILD = ROOT / "build-vision"
+VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the image encoder (llama.cpp's mtmd)
+VSTAMP = VBUILD / "N1OS-BUILD.json"
+MIN_CC = 70                                        # Volta (V100) and newer (the GLM path; see arch_setting)
+MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
+HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # n1os also supports Strix Halo (unified memory)
+PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
+CONTEXTS = [8192, 32768, 65536, 131072]
+DEFAULT_CONTEXT = 32768
+# Weights that stay on the GPUs whatever happens (attention, shared experts, embeddings, the head), split across
+# the cards by layer. Routed experts are the rest of the download and fill whatever VRAM is left. Maya-S24.md:
+# Maya-S's always-on weights are 6.86 GB; its routed experts are Maya-S24's byte for byte, and the 1.8 GB download
+# gap is the 4-bit attention. GSQ-RCO's dense weights are Q8_0 (~8/6 of Maya-S's Q6_K).
+RESIDENT_GB = {
+    "Maya-S-v2-IQ2_XXS": 6.86,
+    "Maya-S24": 5.06,
+    "Maya-M": 6.86,
+    "GSQ-RCO-3.5bit": 9.1,
+}
+# Taken on every card before the expert pool: the CUDA context, the 700 MB reserve and scratch. The 32K KV cache
+# is about 1.1 GB in total (11 DSA layers) and is split across the cards, so it is not charged per card.
+PER_GPU_OVERHEAD_GB = 1.6
+KV_AT_32K_GB = 1.1
+# At or above this share of the experts in VRAM, a larger quant is the one to run: the GPU holds the experts a
+# token uses. Below it, Maya-S24's smaller always-on weights leave more room and decode faster on a 24 GB card.
+FIT_GOOD = 0.85
+# Largest quant first. GSQ-RCO has no draft block, so a pair of GPUs (where drafting runs) skips it.
+QUALITY = ("GSQ-RCO-3.5bit", "Maya-M", "Maya-S-v2-IQ2_XXS", "Maya-S24")
+TITLES = {
+    "Maya-S-v2-IQ2_XXS": "Maya-S",
+    "Maya-S24": "Maya-S24",
+    "Maya-M": "Maya-M",
+    "GSQ-RCO-3.5bit": "GSQ-RCO 3.5-bit",
+}
+# A family is one runner plus the quants it serves. The installer serves "glm" today. "qwen" is the Strata path
+# still in the engine (setup.py); it is not offered here yet. The next open models are added as families.
+FAMILIES = {
+    "glm": {
+        "status": "served",
+        "runner": "glm",
+        "about": "GLM-5.3-Flash: Maya-S, Maya-S24, Maya-M, and GSQ-RCO 3.5-bit",
+        "gpus": "NVIDIA compute capability 7.0 and newer, including RTX 3090 clusters of up to 16; "
+                "experimental AMD gfx1100, gfx1201 and gfx1151",
+    },
+    "qwen": {
+        "status": "engine",
+        "runner": "qwen4exp",
+        "about": "Qwen MoE, the Strata path this engine grew from",
+        "gpus": "NVIDIA compute capability 7.5 and newer (RTX 20 and newer)",
+    },
+}
+MODEL_NAME = "glm-5.3-flash"
+SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API's defaults for requests that set none
+EFFORT = "medium"                                  # thinking level for requests that name none
+HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
+# The models the installer can download: n1os's own quants, made from Z.ai's FP8 release (their model card
+# has the measurements against it), and GSQ-RCO 3.5-bit, a community quant measured with n1os on one RTX 3090.
+# Another glm5-next GGUF can be used with --gguf-dir (experimental).  "folder": the files' folder in the repo ("" =
+# its top).  "sha256" per file name: every download is verified.  "vision": the image encoder's files (the mmproj,
+# made from the official vision tower, and the tokenizer it reads its markers with) - from "repo" / "revision" when
+# it names them, else the model's own repo.
+MODELS = {
+    "Maya-S-v2-IQ2_XXS": {
+        "about": "Maya-S, n1os's compact quant: error-feedback-rounded IQ2_XXS gate/up experts, "
+                 "IQ2_S/IQ3_XXS down projections, Q6_K attention, the MTP draft block, made from Z.ai's FP8 release",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-S-v2-IQ2_XXS",
+        "file": "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 96.5,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf":
+                "a507f2b7b25e04624ee55c631d3b281caea7cfffc747e5247970cd5a7ea91b3f",
+            "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00002-of-00003.gguf":
+                "2d65d88a69f8dc124c8d24bd33b33161ddab218918b4253ad4f500aeede84df5",
+            "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00003-of-00003.gguf":
+                "a6a981c4fee7a53d78bdbd97d8f465d48ddf439cf938ff90617f395e0351b5a6"},
+        "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "Maya-S24": {
+        "about": "Maya-S24, Maya-S with Q4_K attention and shared experts: about 1.5 GB less that stays on the GPU, so "
+                 "24 GB cards hold more experts (decode about 14% faster there, 11% on 32 GB), close to Maya-S in "
+                 "quality",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-S24",
+        "file": "GLM-5.3-Flash-Maya-S24-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 94.7,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-S24-00001-of-00003.gguf":
+                "3dc347757686c1435eae36c4872f5c151191cc5063bc188ce699b97700aae076",
+            "GLM-5.3-Flash-Maya-S24-00002-of-00003.gguf":
+                "4bd445da3a0128a9c5b32228c924e0a622aa4a132c7a8dc9a2c207a4beea8e34",
+            "GLM-5.3-Flash-Maya-S24-00003-of-00003.gguf":
+                "a6fd4e88007ac49b431c7d02be34e43ab7a09224d53a0c52782327613cb41917"},
+        "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "Maya-M": {
+        "about": "Maya-M, n1os's larger quant: error-feedback-rounded IQ2_S gate/up experts, IQ3_XXS down "
+                 "projections (IQ3_S in the most sensitive layers), Q6_K attention, the MTP draft block, made from "
+                 "Z.ai's FP8 release",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "Maya-M",
+        "file": "GLM-5.3-Flash-Maya-M-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 116.0,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-M-00001-of-00003.gguf":
+                "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02",
+            "GLM-5.3-Flash-Maya-M-00002-of-00003.gguf":
+                "285951d2afa0cd98285b03d0dc4aa68d83daf1a6f4a2594fe40b0cdd27ade485",
+            "GLM-5.3-Flash-Maya-M-00003-of-00003.gguf":
+                "ebf1ce713f71207747e10eeebed87597969d8b5e1d9dd817420d2c2f7ca51e0e"},
+        "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "GSQ-RCO-3.5bit": {
+        "about": "GSQ-RCO 3.5-bit, a community quant (pfeifferj, with IST-DASLab's GSQ and RCO methods, not a Project "
+                 "n1os quant): Q3_K/Q2_K experts, Q8_0 dense weights, no MTP draft block; on one RTX 3090 with the "
+                 "rest in ~120 GB of RAM about 20 tokens/s decode and 480-970 tokens/s prefill",
+        "repo": "pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF", "revision": "892aabe2e45835f58f3f24bf03dc5427d345e230",
+        "folder": "", "file": "GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf", "shards": 1, "download_gb": 137.1,
+        "sha256": {"GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf":
+                       "12c32d32c284337d0e9da759dbd559fb41567a4b1c57ede0259057e6f8658f1b"},
+        # n1os image files: the vision tower is the same in every GLM-5.3-Flash quant
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+}
+SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
+PACK_FILES = ("index.txt", "native_experts.txt", "dense.bin", "tokenizer/vocab.json", "tokenizer/merges.txt",
+              "tokenizer/token_type.json", "tokenizer/chat_template.jinja")
+
+
+# ------------------------------------------------------------------------------------------------ small helpers
+def hf_url(repo: str, revision: str, folder: str, file: str) -> str:
+    """A file's download URL on Hugging Face (folder "" = the repo's top)."""
+    return HF.format(repo=repo, revision=revision, path=f"{folder}/{file}" if folder else file)
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+
+
+def configs() -> list:
+    """The installed models' configs, the most recently used first. maya-*.json is a setup from before the rename."""
+    found = {}
+    for pattern in ("n1os-*.json", "maya-*.json"):
+        for p in ROOT.glob(pattern):
+            found[p.resolve()] = p
+    return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def mem_gb() -> tuple:
+    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable (on Windows ullAvailPhys)."""
+    if WIN:
+        m = S._memory_status()
+        return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024 / 2**30
+    except (OSError, ValueError):
+        pass
+    return info.get("MemTotal", 0.0), info.get("MemAvailable", 0.0)
+
+
+def existing(path: Path) -> Path:
+    """`path`, or its nearest folder that exists (where it would be created)."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def rotational(path: Path) -> bool:
+    """True when `path` is on a spinning disk (best effort: findmnt + lsblk; on Windows the drive's MediaType)."""
+    if WIN:
+        drive = existing(path).drive[:1]
+        return drive.isalpha() and S.out(
+            ["powershell", "-NoProfile", "-Command", "Get-PhysicalDisk | Where-Object DeviceId -eq "
+             f"(Get-Partition -DriveLetter {drive}).DiskNumber | Select-Object -ExpandProperty MediaType"]).strip() == "HDD"
+    src = S.out(["findmnt", "-no", "SOURCE", "--target", str(existing(path))]).strip().split("[")[0]
+    rota = S.out(["lsblk", "-ndo", "ROTA", src]).split() if src.startswith("/dev/") else []
+    return bool(rota) and rota[0] == "1"
+
+
+def tool_version(exe: str) -> tuple:
+    m = re.search(r"(\d+)\.(\d+)", S.out([exe, "--version"]))
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def venv_tool(name: str):
+    p = Path(sys.executable).parent / (name + (".exe" if WIN else ""))
+    return str(p) if p.exists() else None
+
+
+def pick_cmake():
+    """CMake 3.24 or newer: the one pip put into .venv first, then the system's."""
+    for c in (venv_tool("cmake"), shutil.which("cmake")):
+        if c and tool_version(c) >= (3, 24):
+            return c
+    return None
+
+
+def gpu_label(g) -> str:
+    if g.get("vendor") == "amd":
+        return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, {g['arch']})"
+    return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, compute capability {S.cc(g)})"
+
+
+def select_build_backend(backend: str) -> None:
+    """Separate build folders and stamps prevent reusing a binary from the other backend."""
+    global BUILD, EXE, STAMP
+    BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
+    EXE = BUILD / ("strata.exe" if WIN else "strata")
+    STAMP = BUILD / "N1OS-BUILD.json"
+
+
+def hip_unified_memory(g) -> bool:
+    # gfx1151 is Strix Halo, even when KFD/sysfs has no product name or reports
+    # only a tiny firmware VRAM carve-out. This is independent of vram_gb.
+    return g.get("arch") == "gfx1151" or bool(g.get("integrated")) or bool(
+        re.search(r"Ryzen AI Max|Radeon\s+(?:8050S|8060S)", g.get("name", ""), re.I))
+
+
+def check_hip_pc(a) -> dict:
+    if WIN or not sys.platform.startswith("linux") or S.is_wsl():
+        fail("n1os experimental HIP backend requires native Linux")
+    found = S.amd_gpus()
+    usable = [g for g in found if g["arch"] in HIP_ARCHS]
+    for g in found:
+        say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by n1os HIP build"))
+    if not usable:
+        fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
+             "(gfx1201), and Strix Halo / Radeon 8060S (gfx1151)")
+    if a.gpus:
+        # two cards split the layers (each caches the experts of its own half); the larger card goes first, as it
+        # takes the bigger first half - the order measured on an R9700 + RX 7900 XT
+        try:
+            want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
+        except ValueError:
+            fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
+        if len(want) != 2 or want[0] == want[1]:
+            fail("n1os HIP port runs on one GPU or splits the model across two: --gpu 0, or --gpus 0,1")
+        picked = [next((g for g in usable if g["index"] == i), None) for i in want]
+        for i, g in zip(want, picked):
+            if g is None:
+                fail(f"GPU {i} is not a supported AMD card")
+        apu = next((g for g in picked if hip_unified_memory(g)), None)
+        if apu is not None:
+            fail(f"GPU {apu['index']} ({apu['name']}) is an APU with unified memory, which stays single-GPU",
+                 "use --gpu N for it, or pick two discrete cards with --gpus")
+        chosen = sorted(picked, key=lambda g: -g["vram_gb"])
+    else:
+        one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
+            usable, key=lambda g: g["vram_gb"])
+        if one is None:
+            fail(f"GPU {a.gpu} is not a supported AMD card")
+        chosen = [one]
+    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
+    if not os.environ.get("ROCM_PATH") and not root.exists():
+        # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
+        versions = sorted(Path("/opt").glob("rocm-[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+        if versions:
+            root = versions[-1]
+    root = root.resolve()
+    if not (root / "llvm/bin/clang++").exists() or not list((root / "lib").glob("libhipblas.so*")):
+        fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
+    if tool_version(str(root / "bin/hipcc")) < (7, 0):
+        fail("n1os HIP port requires ROCm 7 or newer")
+    if not shutil.which("c++"):
+        fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+    cpu, avx2, avx512 = S.cpu_info()
+    if not avx2:
+        fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
+    total, avail = mem_gb()
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, "
+       f"{'two GPUs (layer split)' if len(chosen) == 2 else 'one GPU'}, text only")
+    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
+    ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
+    if any(hip_unified_memory(g) for g in chosen):
+        ok("APU / unified memory: the engine sizes the GPU expert pool from available system RAM")
+    select_build_backend("hip")
+    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS), "rocm": str(root)}
+
+
+def nvcc_range(archs) -> tuple:
+    """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
+    lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
+    hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70)
+    return lo, hi
+
+
+def find_nvcc(archs, given=None) -> tuple:
+    """(nvcc, version) for these GPUs: --nvcc, else the newest toolkit that can build for them (Strata's find_nvcc
+    takes the newest of all, but CUDA 13 cannot build for Volta), else the newest found (reported as unfit), else
+    (None, None)."""
+    def version(c):
+        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
+        return (int(v.group(1)), int(v.group(2))) if v else None
+    if given:
+        return given, version(given)
+    return pick_nvcc([(c, version(c)) for c in dict.fromkeys(c for c in nvcc_candidates() if c and Path(c).exists())],
+                     archs)
+
+
+def nvcc_candidates() -> list:
+    """Every place a CUDA toolkit's nvcc may be (some do not exist): PATH, CUDA_PATH, the default install folders."""
+    exe = "nvcc.exe" if WIN else "nvcc"
+    cands = [shutil.which("nvcc"), os.environ.get("CUDA_PATH") and str(Path(os.environ["CUDA_PATH"]) / "bin" / exe)]
+    if WIN:
+        base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        return cands + [str(p / "bin" / exe) for p in sorted(base.glob("v*"))]
+    cands += [str(p / "bin" / exe) for p in sorted(Path("/usr/local").glob("cuda*"))]
+    return cands + [str(p / "bin" / exe) for p in sorted(Path("/opt").glob("cuda*"))] + ["/usr/bin/nvcc"]
+
+
+def pick_nvcc(found, archs) -> tuple:
+    """Of [(nvcc, version)], the newest that can build for `archs`, else the newest, else (None, None)."""
+    found = sorted([f for f in found if f[1]], key=lambda f: f[1], reverse=True)
+    lo, hi = nvcc_range(archs)
+    fit = [f for f in found if f[1] >= lo and (hi is None or f[1] < hi)]
+    return (fit or found or [(None, None)])[0]
+
+
+def toolkit_hint(archs) -> str:
+    if WIN:
+        return ("NVIDIA's CUDA Toolkit 12.8 for Windows (the driver can stay as it is): "
+                "https://developer.nvidia.com/cuda-12-8-0-download-archive" +
+                (" - Volta (V100) needs 12.x, CUDA 13 dropped it" if min(archs) < 75 else ""))
+    if min(archs) < 75:
+        return ("Volta (V100) needs CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit (CUDA 12.0), "
+                "or NVIDIA's cuda-toolkit-12-8 package: https://developer.nvidia.com/cuda-12-8-0-download-archive")
+    if max(archs) >= 100:
+        return "NVIDIA's cuda-toolkit-12-8 (or newer) package: https://developer.nvidia.com/cuda-downloads"
+    return ("Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit (CUDA 12.0), or NVIDIA's packages: "
+            "https://developer.nvidia.com/cuda-downloads")
+
+
+def cuda_lib_dirs(nvcc: str) -> list:
+    """The toolkit's library folders for the engine's LD_LIBRARY_PATH (none for a distribution's /usr/bin/nvcc); on
+    Windows its DLL folders (bin, and bin\\x64 in CUDA 13) for the engine's PATH."""
+    if WIN:
+        b = Path(nvcc).parent
+        return [str(p) for p in (b, b / "x64") if p.is_dir()]
+    base = Path(nvcc).resolve().parent.parent
+    if base == Path("/usr"):
+        return []
+    return [str(p) for p in (base / "lib64", base / "targets" / "x86_64-linux" / "lib") if p.is_dir()]
+
+
+# ------------------------------------------------------------------------------------------------ 1. the PC
+def choose_gpus(a, found) -> list:
+    """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
+    byid = {g["index"]: g for g in found}
+    usable = [g for g in found if int(g["arch"]) >= MIN_CC]
+    if a.gpus or a.gpu is not None:
+        try:
+            want = [int(x) for x in str(a.gpus).split(",") if x.strip()] if a.gpus else [a.gpu]
+        except ValueError:
+            fail(f"--gpus takes GPU numbers as nvidia-smi numbers them, e.g. --gpus 0,1, not {a.gpus!r}")
+        if not 1 <= len(want) <= MAX_GPUS or len(set(want)) != len(want):
+            fail(f"n1os runs on one GPU or splits the model's layers across up to {MAX_GPUS}: --gpu 0, or "
+                 "--gpus 0,1,2,3 (each number once)")
+        for i in want:
+            if i not in byid or int(byid[i]["arch"]) < MIN_CC:
+                fail(f"GPU {i} cannot be used" + ("" if i in byid else " (not found)"),
+                     "use one of: " + ", ".join(str(g["index"]) for g in usable))
+        return [byid[i] for i in want]
+    if not usable:
+        fail("none of the GPUs can run n1os", "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer)")
+    best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
+    if len(best) == 1:
+        return best
+    opts = ([best[:MAX_GPUS]] if len(best) > 2 else []) + [best[:2], best[:1]]
+    say()
+    say("  n1os can run on one GPU, or split the model's layers across several: each then caches the experts of its")
+    say("  own layers, so together they hold more of them (V100s: ~50 tok/s benchmark on two, ~24 on one).")
+    for i, gs in enumerate(opts, 1):
+        if len(gs) > 2:
+            label = (f"all {len(gs)} together: GPUs " + ", ".join(str(g["index"]) for g in gs) +
+                     f" ({sum(g['vram_gb'] for g in gs):.0f} GB of VRAM)")
+        elif len(gs) == 2:
+            label = f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together"
+        else:
+            label = f"{gpu_label(gs[0])} only"
+        say(f"  {i}) {label}" + ("   (recommended)" if i == 1 else ""))
+    if len(best) > 2:
+        say("     (all of them is the one to use: the model is chosen for that much VRAM. A draft block runs on")
+        say("     exactly two GPUs; --gpus 0,2,5 picks any other set)")
+    return opts[int(ask("Which GPUs?", [str(i) for i in range(1, len(opts) + 1)], "1", a.yes or a.check)) - 1]
+
+
+def check_pc(a) -> dict:
+    step(1, "checking this PC")
+    if a.backend == "hip":
+        return check_hip_pc(a)
+    if not (WIN or sys.platform.startswith("linux")):
+        fail("n1os runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
+    if WIN:
+        warn("Windows support is new (experimental): n1os is developed and measured on Linux - tell us how it runs")
+    if S.is_wsl():
+        warn("this is WSL2, which n1os does not support: Strata measured that WSL2's driver pins only about 1 GB of "
+             "RAM for the GPU, and n1os RAM tier pins tens of GB. Use a native Linux install.")
+    found = S.gpus()
+    if not found:
+        fail("no NVIDIA GPU found (nvidia-smi did not answer)",
+             ("install the NVIDIA driver (https://www.nvidia.com/drivers)" if WIN else
+              "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
+    say("  NVIDIA GPUs:")
+    for g in found:
+        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= MIN_CC else
+                                       "too old (n1os needs compute capability 7.0 or newer)"))
+    chosen = choose_gpus(a, found)
+    archs = sorted({int(g["arch"]) for g in chosen})
+    vram = sum(g["vram_gb"] for g in chosen)
+    ok("using " + " + ".join(gpu_label(g) for g in chosen) +
+       (f": the model's layers are split across the {len(chosen)}" if len(chosen) > 1 else ""))
+    if vram < 23:
+        say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
+            "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
+    problems = []                                      # (what is wrong, how to fix it): all of them at once
+
+    nvcc, nv = find_nvcc(archs, a.nvcc)
+    lo, hi = nvcc_range(archs)
+    want = f"CUDA {lo[0]}.{lo[1]} or newer" + (f" but older than {hi[0]}.0 (CUDA 13 dropped Volta)" if hi else "")
+    if nvcc is None:
+        problems.append((f"the CUDA toolkit (nvcc) is not installed; these GPUs need {want}", toolkit_hint(archs)))
+    elif nv is None:
+        problems.append((f"{nvcc} does not say its version (nvcc --version)", "pass the toolkit's nvcc with --nvcc"))
+    elif nv < lo or (hi is not None and nv >= hi):
+        problems.append((f"nvcc {nv[0]}.{nv[1]} ({nvcc}) cannot build for these GPUs; they need {want}",
+                         toolkit_hint(archs) + " (toolkits can be installed side by side: the newest that fits is "
+                                                "used, or pass one with --nvcc)"))
+    else:
+        ok(f"CUDA toolkit {nv[0]}.{nv[1]}: {nvcc}")
+
+    drv = min(S.driver_major(g) for g in chosen)
+    need_drv = 580 if nv and nv >= (13, 0) else 525
+    if drv < need_drv:
+        problems.append((f"the NVIDIA driver {chosen[0]['driver']} is too old: {need_drv} or newer is needed",
+                         ("" if WIN else "Ubuntu: sudo ubuntu-drivers install, then restart; or ") +
+                         "https://www.nvidia.com/drivers"))
+    else:
+        ok(f"NVIDIA driver {chosen[0]['driver']}")
+
+    if WIN:
+        vcvars = S.find_vcvars()
+        if vcvars is None:
+            problems.append(("the C++ compiler (Visual Studio 2022 Build Tools, 'Desktop development with C++') is "
+                             "not installed", "https://visualstudio.microsoft.com/visual-cpp-build-tools/ - in the "
+                             "installer tick 'Desktop development with C++' (CUDA 12 needs 2019 or 2022, not 2026)"))
+        else:
+            ok(f"C++ compiler: Visual Studio Build Tools ({vcvars})")
+    elif a.host_compiler:
+        if shutil.which(a.host_compiler) is None:
+            problems.append((f"--host-compiler {a.host_compiler} is not installed",
+                             f"Ubuntu/Debian: sudo apt-get install -y {Path(a.host_compiler).name}"))
+        else:
+            ok(f"C++ compiler for nvcc: {a.host_compiler}")
+    elif shutil.which("g++") is None:
+        problems.append(("the C++ compiler (g++) is not installed", "Ubuntu/Debian: sudo apt-get install -y build-essential"))
+    else:
+        ok("C++ compiler: " + (S.out(["g++", "--version"]).splitlines() or ["g++"])[0])
+
+    sc = pick_cmake() or shutil.which("cmake")
+    scv = tool_version(sc) if sc else (0, 0)
+    if scv >= (3, 24):
+        ok(f"CMake {scv[0]}.{scv[1]}")
+    else:
+        ok((f"CMake {scv[0]}.{scv[1]} is older than 3.24" if sc else "no CMake on PATH") +
+           ": a current one goes into .venv in step 3 (pip)")
+    ok(f"Python {sys.version.split()[0]} ({sys.prefix})")
+
+    total, avail = mem_gb()
+    msg = f"RAM: {total:.0f} GB, {avail:.0f} GB available now"
+    ok(msg + ("" if total >= 60 else " - it runs with 32 GB; more RAM keeps more experts close and is faster"))
+    pf = S.page_file_gb()
+    need_pf = int(vram + 8.999)   # the card's memory and the pinned RAM tier are both charged to RAM + page file
+    if pf is not None and pf < need_pf:
+        warn(f"Windows' page file is {pf:.0f} GB; set it to at least {need_pf} GB. Under Windows every allocation on "
+             f"the graphics card ({vram:.0f} GB here) and the engine's pinned RAM tier are both charged to RAM + page "
+             f"file, so with {pf:.0f} GB the RAM tier stays about {need_pf - pf:.0f} GB short of your free RAM and "
+             "those experts are read from the SSD (issue #20: 2.4-4.1 -> 8.4-11 tokens/s on an RTX 5090). \"System "
+             f"managed\" can stay small (8 GB on a 128 GB PC): set a custom size of {need_pf} GB or more - System > "
+             "About > Advanced system settings > Performance > Advanced > Virtual memory - and restart")
+    cpu, avx2, avx512 = S.cpu_info()
+    if not avx2:
+        problems.append((f"the CPU ({cpu}) has no AVX2", "the engine's CPU expert lane and ggml need AVX2"))
+    else:
+        ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'}, {os.cpu_count()} threads)")
+
+    if problems:
+        say()
+        for what, how in problems:
+            say(f"  [X]  {what}")
+            say(f"       {how}")
+        fail("something n1os needs is missing (above)",
+             f"install it and run {ME} again - this script installs nothing system-wide")
+    select_build_backend("cuda")
+    return {"backend": "cuda", "gpus": chosen, "archs": archs, "nvcc": nvcc,
+            "vcvars": str(S.find_vcvars()) if WIN else None}
+
+
+# ------------------------------------------------------------------------------------------------ the GPU plan
+def model_title(model: str) -> str:
+    return TITLES.get(model, model)
+
+
+def kv_gb(ctx: int) -> float:
+    """KV and indexer state at `ctx` tokens: about 1.1 GB at 32K, across 11 DSA layers, split over the cards."""
+    return KV_AT_32K_GB * ctx / DEFAULT_CONTEXT
+
+
+def expert_room_gb(gpus, ctx: int = DEFAULT_CONTEXT) -> float:
+    """VRAM left for the model after per-card overhead and the context's KV cache."""
+    if not gpus:
+        return 0.0
+    vram = sum(float(g.get("vram_gb") or 0) for g in gpus)
+    return max(0.0, vram - kv_gb(ctx) - len(gpus) * PER_GPU_OVERHEAD_GB)
+
+
+def expert_coverage(model: str, room: float) -> float:
+    """Share of this quant's routed experts that fit in `room` GB once its always-on weights are loaded."""
+    if model not in MODELS:
+        return 0.0
+    resident = RESIDENT_GB.get(model, 7.0)
+    experts = max(1.0, MODELS[model]["download_gb"] - resident)
+    return max(0.0, (room - resident) / experts)
+
+
+def gpu_config_label(gpus, ram_gb: float = 0.0) -> str:
+    """'4x NVIDIA GeForce RTX 3090 (96 GB)' when the cards match, else a short list of what is there."""
+    if not gpus:
+        return "no GPU"
+    if any(hip_unified_memory(g) for g in gpus):
+        name = gpus[0].get("name") or "GPU"
+        return f"{name}, {ram_gb:.0f} GB shared memory"
+    names = [g.get("name") or "GPU" for g in gpus]
+    vram = sum(float(g.get("vram_gb") or 0) for g in gpus)
+    if len(gpus) == 1:
+        return f"{names[0]} ({vram:.0f} GB)"
+    if len(set(names)) == 1:
+        return f"{len(gpus)}x {names[0]} ({vram:.0f} GB)"
+    body = " + ".join(f"{g.get('name') or 'GPU'} {float(g.get('vram_gb') or 0):.0f} GB" for g in gpus)
+    return f"{body} ({vram:.0f} GB)"
+
+
+def memory_pool(gpus, ram_gb: float):
+    """The GPUs whose VRAM the plan sizes against. A unified-memory GPU is sized from RAM, not its carve-out."""
+    if gpus and any(hip_unified_memory(g) for g in gpus):
+        return [{"name": gpus[0].get("name") or "GPU", "vram_gb": max(0.0, ram_gb - 16.0)}], True
+    return list(gpus or []), False
+
+
+def quality_order(n_gpus: int) -> list:
+    """Largest quant first. Two GPUs draft the next token, and GSQ-RCO has no draft block, so a pair skips it."""
+    order = [m for m in QUALITY if m in MODELS]
+    if n_gpus == 2:
+        order = [m for m in order if m != "GSQ-RCO-3.5bit"]
+    return order
+
+
+def recommended_context(gpus, model: str) -> int:
+    """The longest context that still keeps `model` on these GPUs. 32K when none of them do; 128K only when the
+    model still fits entirely there."""
+    if model not in MODELS or not gpus:
+        return DEFAULT_CONTEXT
+    fitting = [c for c in CONTEXTS if expert_coverage(model, expert_room_gb(gpus, c)) >= FIT_GOOD]
+    if not fitting:
+        return DEFAULT_CONTEXT
+    best = max(fitting)
+    if best > 65536 and expert_coverage(model, expert_room_gb(gpus, 131072)) < 1.0:
+        return 65536
+    return best
+
+
+def fit_phrase(cov: float) -> str:
+    if cov >= 1.0:
+        return "fits in VRAM"
+    if cov >= FIT_GOOD:
+        return f"~{cov * 100:.0f}% of experts in VRAM"
+    if cov >= 0.4:
+        return f"~{cov * 100:.0f}% of experts in VRAM, the rest in RAM"
+    return "most experts in RAM"
+
+
+def gpu_plan(gpus, ram_gb: float = 0.0) -> dict:
+    """Which quant these GPUs should run, and the context that still keeps it on them.
+
+    A quant is recommended when at least FIT_GOOD of its experts fit in VRAM after the always-on weights, the KV
+    cache and a small reserve on every card. The largest such quant wins. Below that, 24 GB-class cards get
+    Maya-S24 (measured faster there) and anything bigger gets Maya-S.
+    """
+    pool, unified = memory_pool(gpus, ram_gb)
+    label = gpu_config_label(gpus, ram_gb)
+    room = expert_room_gb(pool)
+    cover = {m: expert_coverage(m, room) for m in MODELS}
+    picked = None
+    for m in quality_order(len(gpus or [])):
+        if cover[m] >= FIT_GOOD:
+            picked = m
+            break
+    if picked is None:
+        small = pool and not unified and all(float(g.get("vram_gb") or 0) <= 24.5 for g in pool)
+        picked = "Maya-S24" if small and "Maya-S24" in MODELS else next(iter(MODELS))
+    cov = cover.get(picked, 0.0)
+    title = model_title(picked)
+    if not gpus:
+        summary = f"{title} (no GPU list to size a quant against)"
+    elif cov >= 1.0:
+        summary = f"{label}: {title} fits in VRAM"
+    elif cov >= FIT_GOOD:
+        summary = (f"{label}: {title} keeps about {cov * 100:.0f}% of its experts in VRAM, "
+                   "the largest quant that stays on these GPUs")
+    elif picked == "Maya-S24":
+        summary = f"{label}: {title}, {fit_phrase(cov)}, so the 4-bit attention leaves more of the card for experts"
+    else:
+        summary = f"{label}: {title}, {fit_phrase(cov)}"
+    return {"model": picked, "label": label, "summary": summary, "context": recommended_context(pool, picked),
+            "coverage": cover, "room_gb": room, "unified": unified}
+
+
+def optimize_env(gpus, model: str, ram_gb: float, ctx: int = DEFAULT_CONTEXT) -> dict:
+    """Engine settings for this quant on these GPUs. When the experts that miss VRAM fit in RAM, pin them there
+    so decode does not read them from the SSD. The start refuses the pin when RAM cannot hold them, so this stays
+    off unless RAM covers the spill plus room for the OS. `ctx` is the context the config will run."""
+    if model not in MODELS or not gpus or any(hip_unified_memory(g) for g in gpus):
+        return {}
+    pool, _ = memory_pool(gpus, ram_gb)
+    room = expert_room_gb(pool, ctx)
+    resident = RESIDENT_GB.get(model, 7.0)
+    experts = MODELS[model]["download_gb"] - resident
+    spill = max(0.0, experts - max(0.0, room - resident))
+    if spill >= 0.5 and ram_gb >= spill + 20:
+        return {"STRATA_GLM_RAM_RESIDENT": "1"}
+    return {}
+
+
+# ------------------------------------------------------------------------------------------------ 2. choices
+def choose_context(a, prev_ctx, plan) -> int:
+    if a.context:
+        return a.context
+    rec = plan.get("context") or DEFAULT_CONTEXT
+    if rec not in CONTEXTS:
+        rec = DEFAULT_CONTEXT
+    default = prev_ctx if prev_ctx in CONTEXTS else rec
+    say()
+    say("  Context length = how much text the model sees at once (the chat, files, tool output). A longer one takes")
+    say("  VRAM from the expert cache, so answers get a little slower:")
+    mark = "   (recommended)" if rec == DEFAULT_CONTEXT else "   (recommended for these GPUs)"
+    for i, c in enumerate(CONTEXTS, 1):
+        say(f"  {i}) {c // 1024}K tokens" + (mark if c == rec else ""))
+    pick = ask("Context?", [str(i) for i in range(1, len(CONTEXTS) + 1)], str(CONTEXTS.index(default) + 1), a.yes)
+    return CONTEXTS[int(pick) - 1]
+
+
+def download_dir(models: Path, quant: str) -> Path:
+    """A download's folder: <models folder>/<quant> (--models-dir).  Files already there are used where they are:
+    in that folder, in <models folder>/glm-5.3-flash-<quant> (an earlier version's downloads), or straight in the
+    models folder."""
+    m = MODELS[quant]
+    names = [m["file"].format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)]
+    d = models / quant
+    for c in (d, models / f"glm-5.3-flash-{quant}".lower(), models):
+        if all((c / n).exists() for n in names):
+            return c
+    return d
+
+
+def choose_model(a, models: Path, inst: dict, plan: dict) -> tuple:
+    """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
+    the downloads. The quant already on disk is the default; `plan` (from the chosen GPUs) is the recommendation."""
+    if a.gguf_dir:
+        first, why = local_first(Path(a.gguf_dir))
+        if first is None:
+            fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
+        return "local", first
+    rec = plan["model"] if plan.get("model") in MODELS else next(iter(MODELS))
+    if a.model:
+        if a.model != rec:
+            say(f"  --model {a.model} overrides the quant for these GPUs ({model_title(rec)}).")
+        return "download", a.model
+    opts = list(MODELS)
+    default = inst["quant"] if inst.get("quant") in MODELS else rec
+    say()
+    say("  The model to download (GLM-5.3-Flash GGUF files you already have: --gguf-dir <file or folder>):")
+    if default != rec and default in MODELS:
+        say(f"  Enter keeps {model_title(default)} (already set up). {model_title(rec)} is the better fit here.")
+    show_fit = any((plan.get("coverage") or {}).values())
+    for i, q in enumerate(opts, 1):
+        m, d = MODELS[q], download_dir(models, q)
+        have = all((d / m["file"].format(i=j, n=m["shards"])).exists() for j in range(1, m["shards"] + 1))
+        label = f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"
+        note = f", {fit_phrase(plan['coverage'].get(q, 0.0))}" if show_fit else ""
+        say(f"  {i}) {q}: {label}{note}" + ("   (recommended)" if q == rec else ""))
+    pick = ask("Model?", [str(i) for i in range(1, len(opts) + 1)], str(opts.index(default) + 1), a.yes)
+    return "download", opts[int(pick) - 1]
+
+
+# ------------------------------------------------------------------------------------------------ 3. tools
+def tools_step(a) -> Path:
+    """The Python packages (into .venv) and llama.cpp's source at the pinned commit - listed, and asked, first."""
+    step(3, "Python packages and llama.cpp's source")
+    stamp = Path(sys.prefix) / ".strata-pip.json"          # S.pip_install's record of what it installed
+    have = read_json(stamp) if stamp.exists() else []
+    need = [p for p in PY_PACKAGES if p not in (have if isinstance(have, list) else [])]
+    llama = Path(a.llama_dir).expanduser().resolve() if a.llama_dir else ROOT / "third_party" / "llama.cpp"
+    llama_ok = (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir()
+    if a.llama_dir and not llama_ok:
+        fail(f"{llama} is not a llama.cpp checkout (its ggml/ and gguf-py/ folders are missing)")
+    downloads = []
+    if need:
+        downloads.append("Python packages from PyPI into .venv: " + ", ".join(need) + " (roughly 50-100 MB)")
+    if not llama_ok:
+        downloads.append(f"llama.cpp's source at the pinned commit {S.LLAMA_CPP_COMMIT[:10]} from GitHub, "
+                         f"{S.LLAMA_CPP_ZIP} (tens of MB): ggml for the engine build, gguf-py for the pack builder")
+    if downloads:
+        say("  This step downloads:")
+        for d in downloads:
+            say("    - " + d)
+        if ask("  Download them now?", ["y", "n"], "y", a.yes) != "y":
+            fail("nothing was downloaded", f"run {ME} again when you are ready (or pass --llama-dir with a "
+                                           f"llama.cpp checkout at commit {S.LLAMA_CPP_COMMIT[:10]})")
+    S.pip_install(PY_PACKAGES, ", ".join(PY_PACKAGES))
+    if not llama_ok:
+        llama = S.get_llama_cpp()
+    ok(f"llama.cpp {S.LLAMA_CPP_COMMIT[:10]}: {llama}")
+    return llama
+
+
+# ------------------------------------------------------------------------------------------------ 4. the engine
+def cached_generator():
+    """The CMake generator build/ was configured with before (another one cannot be used there), or None."""
+    m = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (BUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
+        if (BUILD / "CMakeCache.txt").exists() else None
+    return m.group(1).strip() if m else None
+
+
+def arch_setting(archs) -> str:
+    """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
+    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those the build
+    asks CMake for this machine's own GPUs ("native", which the guard leaves to CMake), with CUDA_VISIBLE_DEVICES
+    limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix that makes this unnecessary."""
+    return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
+
+
+def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False) -> dict | None:
+    """cmake configure + build of the `strata` target in build/; the exact commands are printed as they run.
+    soft: a failure warns and returns None (the engine already there keeps working) instead of stopping."""
+    def stop(what):
+        msg = f"the engine build stopped while {what} (the reason is above)"
+        hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12 needs Visual Studio 2019 or "
+                "2022 (its Build Tools are enough);" if WIN else
+                "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
+                "again (it is found by itself), or pass --host-compiler g++-13;") + (
+                "\n       'Unsupported gpu architecture compute_70' - CUDA 13 cannot build for Volta, "
+                "install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it again "
+                "(it continues)")
+        if soft:
+            warn(msg + "; starting the engine compiled before")
+            return None
+        fail(msg, hint)
+
+    cmake = pick_cmake()
+    if cmake is None:
+        return stop(f"looking for CMake 3.24+ (pip installs one into .venv: run {ME} --setup)")
+    gen = cached_generator()
+    ninja = venv_tool("ninja") or shutil.which("ninja")
+    conf = [cmake]
+    if ninja and gen in (None, "Ninja"):
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    cuda_archs = arch_setting(archs)
+    conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
+             "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+             "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+    if host_compiler:
+        conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
+    # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
+    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
+    # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
+    jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
+    build = [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)]
+    say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
+        " (10-30 minutes the first time, a few minutes after an update) ...")
+    if cuda_archs == "native":
+        say("  (CMakeLists.txt refuses an explicit sm_70 - Strata's own floor is sm_75 - so CMake is asked for this")
+        say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
+    stopped = cmake_steps(conf, build, env, "build-n1os.bat")
+    if stopped:
+        return stop(stopped)
+    meta = {"src": src, "archs": archs, "gpu_ids": list(gpu_ids), "nvcc": nvcc, "host_compiler": host_compiler,
+            "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M")}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
+def cmdline(cmd) -> str:
+    """One command as a line of a Windows .bat."""
+    return " ".join(f'"{x}"' if re.search(r'[\s;&|<>^()]', str(x)) else str(x) for x in cmd)
+
+
+def shell_join(cmd) -> str:
+    """One command as it is typed here: a POSIX shell, or Windows' cmd."""
+    return cmdline(cmd) if WIN else shlex.join(cmd)
+
+
+def cmake_steps(conf, build, env, bat_name: str) -> str | None:
+    """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
+    worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
+    compiler's environment - the way Strata's setup.py builds there (cmake_build)."""
+    if not WIN:
+        if run(conf, env=env, check=False).returncode != 0:
+            return "configuring"
+        if run(build, env=env, check=False).returncode != 0:
+            say("  (the build stopped - trying it once more: it continues where it stopped)")
+            if run(build, env=env, check=False).returncode != 0:
+                return "compiling"
+        return None
+    vcvars = S.find_vcvars()
+    if vcvars is None:
+        return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
+    bat = ROOT / bat_name
+    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
+                   '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
+                   f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
+    say(f"  > {bat}   (Visual Studio's environment, then:)")
+    say("  > " + cmdline(conf))
+    say("  > " + cmdline(build))
+    rc = subprocess.call(["cmd", "/c", str(bat)], env=env)
+    return None if rc == 0 else "compiling" if rc == 4 else "configuring"
+
+
+PROBE_CU ="""#include <cmath>
+#include <string>
+#include <vector>
+__global__ void k(float* x) { x[0] = rsqrtf(x[0]) + sinf(x[1]) + expf(x[2]) + __expf(x[3]) + sqrtf(x[4]); }
+int main() { std::vector<std::string> v(1); return (int) std::cos(0.0) - 1 + (int) v.size() - 1; }
+"""
+
+
+def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
+    """(nvcc, host compiler or None for the default) that compile the engine's kind of CUDA here.  Every installed
+    toolkit that can build for these GPUs (newest first; --nvcc alone if given) with the default g++, then each
+    installed g++-N (newest first; --host-compiler alone if given), on a small file the way the engine compiles:
+    C++20 and the math functions the kernels use.  A toolkit refuses a g++ newer than it supports, and a newer
+    glibc's own rsqrtf/sinpi declarations clash with older CUDA headers - nothing but trying tells which pair works
+    on a given system.  On Windows the compiler is Visual Studio's (in its vcvars64.bat environment): only the
+    toolkits are tried."""
+    import tempfile
+
+    def version(c):
+        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
+        return (int(v.group(1)), int(v.group(2))) if v else None
+    if nvcc_given:
+        nvccs = [nvcc_given]
+    else:
+        seen, found = set(), []
+        for c in nvcc_candidates():
+            if c and Path(c).exists() and os.path.realpath(c) not in seen:
+                seen.add(os.path.realpath(c))
+                found.append((c, version(c)))
+        lo, hi = nvcc_range(archs)
+        nvccs = [c for c, v in sorted((f for f in found if f[1]), key=lambda f: f[1], reverse=True)
+                 if v >= lo and (hi is None or v < hi)]
+    hcs = [None] if WIN else [hc_given] if hc_given else [None] + sorted(
+        {q.name for d in ("/usr/bin", "/usr/local/bin") for q in Path(d).glob("g++-[0-9]*")
+         if re.fullmatch(r"g\+\+-\d+", q.name)}, key=lambda n: -int(n[4:]))
+    vcvars = S.find_vcvars() if WIN else None
+    say("  Finding a CUDA toolkit and C++ compiler that build the engine here ...")
+    with tempfile.TemporaryDirectory() as t:
+        src = Path(t) / "probe.cu"
+        src.write_text(PROBE_CU, encoding="utf-8")
+        for nv in nvccs:
+            for c in hcs:
+                cmd = [nv, "-std=c++20", "-c", str(src), "-o", str(Path(t) / "probe.o")] + \
+                      (["-ccbin", shutil.which(c) or c] if c else [])
+                if vcvars:                             # cl.exe is on PATH only inside Visual Studio's environment
+                    bat = Path(t) / "probe.bat"
+                    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(cmd)}\r\n', encoding="utf-8")
+                    cmd = ["cmd", "/c", str(bat)]
+                if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
+                    ok(f"{nv} with " + ("Visual Studio's C++ compiler" if WIN else c or "the default g++"))
+                    return nv, c
+    warn("no installed CUDA toolkit and C++ compiler pair compiled a test file: the build will show why (" +
+         toolkit_hint(archs) + ")")
+    return (nvccs[0] if nvccs else nvcc_given), hc_given
+
+
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | None:
+    root = Path(pc["rocm"])
+    cmake = pick_cmake()
+    if not cmake:
+        fail("CMake 3.24 or newer is needed")
+    env = dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
+               ROCM_PATH=str(root), HIP_PATH=str(root))
+    env["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm/bin"), env.get("PATH", "")])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([str(root / "lib"), env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
+    env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
+    conf = [cmake, "-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
+            "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
+            "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+            f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
+            f"-DCMAKE_HIP_COMPILER={root / 'llvm/bin/clang++'}", f"-DCMAKE_PREFIX_PATH={root}",
+            f"-DSTRATA_GGML_DIR={llama}"]
+    jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
+    say("  Compiling n1os for AMD " + ", ".join(pc["archs"]) + " ...")
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env, ""):
+        if soft:
+            warn("HIP rebuild failed; starting the previous engine")
+            return None
+        fail("the HIP engine build failed", "see the compiler output above")
+    meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
+            "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
+            "lib_dirs": [str(root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
+def build_step(a, pc, llama: Path) -> dict:
+    step(4, "the engine")
+    src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
+    meta = read_json(STAMP)
+    if pc.get("backend") == "hip":
+        if (EXE.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
+                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]):
+            ok(f"HIP engine already compiled: {EXE}")
+            return meta
+        return compile_engine_hip(pc, llama, src)
+    if (EXE.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
+            and (not a.nvcc or a.nvcc == meta.get("nvcc"))
+            and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
+        ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {EXE}")
+        return meta
+    nvcc, hc = toolchain_for(pc["archs"], a.nvcc, a.host_compiler)
+    pc["nvcc"] = nvcc or pc["nvcc"]
+    return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src)
+
+
+def refresh_engine(cfg: dict) -> None:
+    """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed."""
+    meta = read_json(STAMP)
+    if not meta or Path(cfg["exe"]).resolve() != EXE.resolve():
+        return
+    src = S.source_hash(S.ENGINE_SOURCES)
+    if meta.get("src") == src:
+        return
+    if cfg.get("backend") == "hip":
+        root = Path(meta.get("rocm") or "/opt/rocm")
+        llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
+        if not (root / "llvm/bin/clang++").exists() or not (llama / "ggml/CMakeLists.txt").exists():
+            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
+            return
+        pc = {"rocm": str(root), "archs": meta["archs"],
+              "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
+        compile_engine_hip(pc, llama, src, soft=True)
+        return
+    say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
+    nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
+    if not nvcc or not Path(nvcc).exists() or not (llama / "ggml" / "CMakeLists.txt").exists():
+        warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
+             f"({ME} --setup --rebuild compiles it again)")
+        return
+    gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
+    compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True)
+
+
+# ------------------------------------------------------------------------------------------------ 5. the model
+def shard_set(first: Path) -> list:
+    """All files of a split GGUF from its first one (<name>-00001-of-0000N.gguf), or just the file."""
+    m = SHARD_RE.search(first.name)
+    if not m:
+        return [first]
+    n, stem = int(m.group(2)), first.name[:m.start()]
+    return [first.with_name(f"{stem}-{i:05d}-of-{n:05d}.gguf") for i in range(1, n + 1)]
+
+
+def gguf_head(path: Path) -> tuple:
+    """(general.architecture, tensor count) from the start of a GGUF header: only the key/values before the
+    architecture are read (gguf-py writes it first), so a folder of big files is scanned quickly.  ("", 0) when it
+    is not a GGUF file or the key does not come early."""
+    import struct
+    from gguf_reader import GGUF_MAGIC, GGUF_META
+    try:
+        with open(path, "rb") as f:
+            def blob():
+                (n,) = struct.unpack("<Q", f.read(8))
+                if n > 1 << 20:
+                    raise ValueError("not a GGUF string")
+                return f.read(n)
+            magic, _, n_tensors, n_kv = struct.unpack("<IIQQ", f.read(24))
+            if magic != GGUF_MAGIC:
+                return "", 0
+            for _ in range(min(n_kv, 32)):
+                key = blob()
+                kind, size = GGUF_META[struct.unpack("<I", f.read(4))[0]]
+                if kind == "string":
+                    val = blob()
+                    if key == b"general.architecture":
+                        return val.decode("utf-8", "replace"), n_tensors
+                elif kind == "array":
+                    _, esize = GGUF_META[struct.unpack("<I", f.read(4))[0]]
+                    (count,) = struct.unpack("<Q", f.read(8))
+                    if esize is None:                  # an array of strings (the vocabulary) - the key was not early
+                        break
+                    f.seek(esize * count, 1)
+                else:
+                    f.seek(size, 1)
+    except (OSError, ValueError, KeyError, struct.error):
+        pass
+    return "", 0
+
+
+def glm_files(d: Path) -> list:
+    """The GLM-5.3-Flash models in the folder `d`, as their first files (-00001-of- for a split one).  A single file
+    without tensors (a vocabulary, like the vision folder's) is no model; unsloth's split models keep only metadata
+    in their first file."""
+    try:
+        files = sorted(d.glob("*.gguf"))
+    except OSError:
+        return []
+    found = []
+    for f in files:
+        m = SHARD_RE.search(f.name)
+        if m and int(m.group(1)) != 1:
+            continue
+        arch, n = gguf_head(f)
+        if arch in GLM_ARCHS and (n > 0 or m):
+            found.append(f)
+    return found
+
+
+def local_first(p: Path) -> tuple:
+    """(the model's first .gguf file, None) from one of its files or the folder that holds it, or (None, why not)."""
+    p = p.expanduser().resolve()
+    if p.is_file():
+        first = shard_set(p)[0]
+        arch = gguf_head(first)[0] if first.exists() else ""
+        if first.exists() and arch not in GLM_ARCHS:
+            return None, f"{first.name} is " + (f"a {arch!r} model, not GLM-5.3-Flash ({GLM_ARCHS[0]})" if arch else
+                                                "not a GGUF file")
+        return first, None
+    found = glm_files(p) if p.is_dir() else []
+    if not found:
+        return None, (f"no GLM-5.3-Flash GGUF file in {p}" if p.is_dir() else f"{p} does not exist")
+    if len(found) > 1:
+        return None, f"{p} holds {len(found)} GLM-5.3-Flash models: name the file (" + \
+                     ", ".join(f.name for f in found) + ")"
+    return found[0], None
+
+
+def incomplete(path: Path):
+    """Why this GGUF file is not whole, or None when it is: as long as its own tensor directory says (the same test
+    as Strata's check_shards, without stopping).  Reads the header only."""
+    if not path.exists():
+        return "missing"
+    from gguf_reader import GGUFFile
+    try:
+        g = GGUFFile(path)
+    except Exception as e:                             # noqa: BLE001 - a partial header raises anything
+        return f"not a whole GGUF file ({e})"
+    need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+    have = path.stat().st_size
+    return None if have >= need else f"short: {have:,} of {need:,} bytes"
+
+
+def quant_of(first: Path) -> str:
+    m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
+    return m.group(1) if m else first.parent.name
+
+
+def sha256_ok(path: Path, want: str) -> bool:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(64 << 20), b""):
+            h.update(b)
+    return h.hexdigest() == want.lower()
+
+
+def offer_download(a, quant: str, d: Path, shards: list) -> bool:
+    """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
+    (or --download-model).  False: nothing was downloaded."""
+    m = MODELS[quant]
+    missing = [s for s in shards if incomplete(s)]
+    urls = {s: hf_url(m["repo"], m["revision"], m["folder"], s.name) for s in shards}
+    on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
+    remaining = max(0.0, m["download_gb"] - on_disk)
+    free = shutil.disk_usage(existing(d)).free / 1e9
+    curl = shutil.which("curl")
+    cmds = [["mkdir"] + ([] if WIN else ["-p"]) + [str(d)]] + \
+        [["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]] for s in missing]
+    say(f"  {quant}: {m['about']}.")
+    say(f"  Source: https://huggingface.co/{m['repo']}" + (f" (folder {m['folder']}/)" if m["folder"] else "") +
+        "; the files' own license applies.")
+    say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
+        f"{len(missing)} still to download, about "
+        f"{remaining:.0f} GB, into")
+    say(f"    {d}   ({free:.0f} GB free there)")
+    if free < remaining + 3:
+        fail(f"not enough free space in {d}: about {remaining + 3:.0f} GB are needed (the model + its pack)",
+             f"free some space, or put the model on another drive: {ME} --setup --models-dir " +
+             (r"D:\n1os-models" if WIN else "/path/on/nvme"))
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: the engine reads experts from these files while it answers - use an "
+             "NVMe SSD (--models-dir)")
+    say("  The exact commands (resumable: running them again continues an interrupted download):")
+    for c in cmds:
+        say("    " + shell_join(c))
+    say("  You can also run them yourself (or download the files any other way into that folder, or pass")
+    say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
+    if not curl:
+        warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
+             "same URLs are downloaded with Python instead (also resumable)")
+    if not a.download_model and ask(f"  Download about {remaining:.0f} GB now with these commands? (y/n)",
+                                    ["y", "n"], "n", False) != "y":
+        say()
+        say(f"Nothing was downloaded. When the files are in place, run {ME} again "
+            f"({ME} --download-model downloads them without asking).")
+        return False
+    d.mkdir(parents=True, exist_ok=True)
+    for s in missing:
+        if curl:
+            cmd = ["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]]
+            if run(cmd, check=False).returncode != 0:
+                fail(f"the download of {s.name} stopped (the reason is above)",
+                     f"run {ME} --download-model again: it continues where it stopped")
+        else:
+            S.download(urls[s], s)
+        why = incomplete(s)
+        if why:
+            fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
+        want = m["sha256"].get(s.name)
+        if want:
+            say(f"  checking {s.name}'s sha256 ...")
+            if not sha256_ok(s, want):
+                fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
+        ok(f"{s.name} downloaded")
+    return True
+
+
+def model_step(a, models: Path, choice: tuple):
+    """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
+    step(5, "the model (GLM-5.3-Flash, GGUF)")
+    kind, what = choice
+    if kind == "local":
+        shards, quant, d = shard_set(what), quant_of(what), what.parent
+        for s in shards:
+            why = incomplete(s)
+            if why:
+                fail(f"{s.name}: {why}", f"finish copying or downloading it, then run {ME} again")
+        if quant not in MODELS:
+            warn(f"{quant}: experimental - only {', '.join(MODELS)} has been measured with n1os (README.md)")
+    else:
+        quant = what
+        m = MODELS[quant]
+        d = download_dir(models, quant)
+        shards = [d / m["file"].format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)]
+        if any(incomplete(s) for s in shards) and not offer_download(a, quant, d, shards):
+            return None
+    from gguf_reader import GGUFFile
+    arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
+    if arch not in GLM_ARCHS:
+        fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+    gb = sum(s.stat().st_size for s in shards) / 1e9
+    ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: expect slow answers (the engine reads experts from it) - an NVMe SSD "
+             "is strongly recommended")
+    return d, shards, quant
+
+
+# ------------------------------------------------------------------------------------------------ 6. the pack
+def pack_source(pack: Path):
+    """The first .gguf file a pack indexes (native_experts.txt's header names it), or None (no pack there)."""
+    try:
+        with open(pack / "native_experts.txt", encoding="utf-8") as f:
+            m = re.search(r"absolute offsets in ([^,)]+)", f.readline())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
+    step(6, "the pack (the engine's index of the model files)")
+    # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
+    # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
+    pack = d / "pack"
+    if pack_source(pack) not in (None, shards[0].name):
+        pack = d / f"pack-{quant_of(shards[0])}".lower()
+    if not a.repack and pack_source(pack) == shards[0].name and all((pack / f).exists() for f in PACK_FILES):
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack is written next to the GGUF files (the engine finds them at <pack>/..)",
+             "link the .gguf files into a writable folder (" + ("mklink /H DIR\\<file> <file>, for each file" if WIN
+                                                                else "mkdir -p DIR && ln -s /path/to/*.gguf DIR/") +
+             ") and pass "
+             "--gguf-dir DIR")
+    say("  Writing the index of every tensor, the small float weights (about 1 GB) and the tokenizer; the experts")
+    say("  stay in the GGUF files (a few minutes) ...")
+    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    # --compat-bf16: the GLM pack stores the projections its kernels read as BF16 (router, indexer, absorbed MLA,
+    # KDA gates) in BF16 even where the GGUF quantized them or keeps them F32 (tools/iq_pack.py GLM5NEXT_BF16)
+    run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
+         "--compat-bf16"], env=env)
+    missing = [f for f in PACK_FILES if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    ok(f"pack: {pack}")
+    return pack
+
+
+# ------------------------------------------------------------------------------------------------ 7. images
+def fetch(url: str, dst: Path, want: str | None) -> None:
+    """One file, resumable (curl -C -, else Python), then its sha256 when one is published."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("curl"):
+        if run(["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(dst), url], check=False).returncode != 0:
+            fail(f"the download of {dst.name} stopped (the reason is above)", f"run {ME} --setup again: it "
+                                                                              "continues where it stopped")
+    else:
+        S.download(url, dst)
+    if want and not sha256_ok(dst, want):
+        dst.unlink(missing_ok=True)
+        fail(f"{dst.name}: the sha256 does not match the published one (the file was removed)",
+             f"run {ME} --setup again to download it again")
+
+
+def compile_vision(pc, meta, llama: Path, src: str) -> bool:
+    """strata-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
+    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
+    cmake = pick_cmake()
+    if cmake is None:
+        return False
+    run([sys.executable, str(ROOT / "tools" / "vision" / "glm5next_patch.py"), str(llama)])
+    gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (VBUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
+        if (VBUILD / "CMakeCache.txt").exists() else None
+    ninja = venv_tool("ninja") or shutil.which("ninja")
+    conf = [cmake]
+    if ninja and (gen is None or gen.group(1).strip() == "Ninja"):
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    archs = meta.get("archs") or pc["archs"]
+    conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
+             f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
+             "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}"]
+    if meta.get("host_compiler"):
+        conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
+    jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
+    say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
+    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "strata-vision", "-j", str(jobs)], None,
+                   "build-n1os-vision.bat"):
+        return False
+    VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+                                  "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
+    return VEXE.exists()
+
+
+def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
+    """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
+    encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
+    first start how much that is on this GPU (serve/server.py, vision_footprint)."""
+    step(7, "images (the vision encoder)")
+    if pc.get("backend") == "hip":
+        ok("HIP port: text only; vision is not enabled")
+        return None
+    # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
+    # every GLM-5.3-Flash quant
+    spec = MODELS.get(quant) or MODELS[next(iter(MODELS))]
+    m = spec.get("vision")
+    if a.no_vision:
+        ok("skipped (--no-vision): the model reads text only")
+        return None
+    if m is None:
+        warn(f"no vision files are published for {quant}: the model reads text only")
+        return None
+    vd = d / m["folder"]
+    files = {k: vd / m[k] for k in ("mmproj", "vocab")}
+    missing = [p for p in files.values() if not p.exists() or (m["sha256"].get(p.name) and p.stat().st_size == 0)]
+    if missing:
+        repo, rev = m.get("repo", spec["repo"]), m.get("revision", spec["revision"])
+        src_url = {p: hf_url(repo, rev, m["folder"], p.name) for p in missing}
+        say(f"  The vision encoder's files ({m['download_gb']:.2f} GB) from https://huggingface.co/"
+            f"{repo} (folder {m['folder']}/), into {vd}:")
+        for p in missing:
+            say("    " + shell_join(["curl", "-L", "--fail", "-C", "-", "-o", str(p), src_url[p]]))
+        if not (a.download_model or a.yes) and ask("  Download them now? (y/n)", ["y", "n"], "y", False) != "y":
+            warn(f"not downloaded: the model reads text only ({ME} --setup asks again)")
+            return None
+        for p in missing:
+            fetch(src_url[p], p, m["sha256"].get(p.name))
+            ok(f"{p.name} downloaded")
+    src = S.source_hash(("tools/vision",))
+    vmeta = read_json(VSTAMP)
+    if not (VEXE.exists() and not a.rebuild and vmeta.get("src") == src
+            and set(meta.get("archs") or pc["archs"]) <= set(vmeta.get("archs", []))):
+        if not compile_vision(pc, meta, llama, src):
+            warn("the vision encoder did not compile (the reason is above): the model reads text only - "
+                 f"{ME} --setup --rebuild tries again")
+            return None
+    ok(f"vision encoder: {VEXE}")
+    return {"exe": str(VEXE), "mmproj": str(files["mmproj"]), "model": str(files["vocab"]), "gpu": True}
+
+
+# ------------------------------------------------------------------------------------------------ 8. config + start
+def parse_env(items) -> dict:
+    env = {}
+    for it in items:
+        k, sep, v = it.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            fail(f"--env takes KEY=VALUE, e.g. --env STRATA_GLM_RAM_HEADROOM_GB=4, not {it!r}")
+        env[k] = v
+    return env
+
+
+def write_run_script(cfg_path: Path, port: int) -> Path:
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+           "--port", str(port)]
+    if WIN:
+        script = ROOT / f"run-{cfg_path.stem}.bat"
+        script.write_text(f'@echo off\r\nrem starts the n1os dashboard and API (written by n1os.py; {ME} does '
+                          f'the same)\r\ncd /d "{ROOT}" || exit /b 1\r\n{cmdline(cmd)} %*\r\n', encoding="utf-8")
+        return script
+    script = ROOT / f"run-{cfg_path.stem}.sh"
+    script.write_text("#!/bin/sh\n# starts the n1os dashboard and API (written by n1os.py; ./n1os.sh does the "
+                      "same)\ncd " + shlex.quote(str(ROOT)) + " || exit 1\nexec " + shlex.join(cmd) + ' "$@"\n',
+                      encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
+                 choice: tuple | None = None) -> Path:
+    step(8, "the configuration and the start script")
+    port = a.port or 8080
+    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx)], "cwd": str(ROOT),
+           "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
+           "port": port}
+    env = parse_env(a.env)
+    user_env = set(env)
+    if pc.get("backend") != "hip" and quant in MODELS:
+        for k, v in optimize_env(pc["gpus"], quant, mem_gb()[0], ctx).items():
+            env.setdefault(k, v)
+    if pc.get("backend") == "hip":
+        cfg["backend"] = "hip"
+        # Leave space for the Linux desktop. The engine sizes its prompt chunk from
+        # the available prompt-memory budget; forcing 256 here severely slows HIP.
+        hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
+        gpus = pc["gpus"]
+        if len(gpus) == 1:
+            hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
+        # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
+        # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
+        if any(hip_unified_memory(g) for g in gpus):   # an APU is always the only GPU (check_hip_pc)
+            total_ram, _ = mem_gb()
+            hip_env.update({"STRATA_GLM_RESERVE_MB": "1024", "STRATA_GLM_PREFILL_SUB": "1024",
+                            "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
+        elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
+            hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+        # The prompt projections' hipBLASLt solutions measured per architecture (tools/hip), one table per card's
+        # architecture (':'-separated: each card takes its own). The engine refuses a table made for another
+        # hipBLASLt version and keeps plain hipBLAS.
+        tables = []
+        for arch in dict.fromkeys(g.get("arch", "") for g in gpus):
+            found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"))
+            if found:
+                tables.append(str(found[-1]))
+        if tables:
+            hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
+        env = {**hip_env, **env}
+    if env:
+        cfg["env"] = env
+    if quant in MODELS and pc.get("gpus") and pc.get("backend") != "hip":
+        total_ram = mem_gb()[0]
+        plan = gpu_plan(pc["gpus"], total_ram)
+        pool, _ = memory_pool(pc["gpus"], total_ram)
+        cfg["gpu_profile"] = {"label": plan["label"], "recommended": plan["model"],
+                              "expert_coverage": round(expert_coverage(quant, expert_room_gb(pool, ctx)), 3)}
+        if env.get("STRATA_GLM_RAM_RESIDENT") == "1" and "STRATA_GLM_RAM_RESIDENT" not in user_env:
+            ok(f"experts that do not fit in VRAM stay pinned in RAM ({total_ram:.0f} GB), so answers do not wait on the SSD")
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if vision:
+        cfg["vision"] = vision
+    suffix = "-hip" if pc.get("backend") == "hip" else ""
+    cfg_path = ROOT / f"n1os-{quant.lower()}{suffix}.json"
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
+    gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
+    cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
+                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "written": time.strftime("%Y-%m-%d %H:%M")}
+    cal = saved_calibration(cfg)                       # tuned on this PC for this model and context before
+    if cal is not None:
+        tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
+        tuned.update(env)                              # (an --env given now wins)
+        if tuned:
+            cfg["env"] = tuned
+        ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else "") +
+           (": " + ", ".join(f"{k}={v}" for k, v in cal["settings"].items()) if cal.get("settings") else ""))
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, port)}")
+    return cfg_path
+
+
+# ------------------------------------------------------------------------------------------------ calibration
+CAL_STORE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "n1os" / "calibration.json"
+
+
+def hardware_key(cfg: dict) -> str:
+    """What a calibration is valid for: these GPUs, this CPU and RAM, the model (its quant), the context, text or
+    images (the context's KV cache and the image encoder take VRAM from the expert pool)."""
+    found = {g["index"]: g for g in S.gpus() or []}
+    sel = [found.get(i) or {} for i in cfg.get("gpu") or []]
+    a = cfg.get("args") or []
+    ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else "?"
+    quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
+    return "|".join([" + ".join(g.get("name", "?") for g in sel) or "?",
+                     f"{sum(g.get('vram_gb', 0) for g in sel):.0f}GB", S.cpu_info()[0], f"{S.ram_gb():.0f}GB", quant,
+                     str(ctx), "images" if cfg.get("vision") else "text"])
+
+
+def load_calibrations() -> dict:
+    """Tunings saved for this PC. A file from before the rename (~/.config/project-maya) is read too; a newer
+    n1os file wins on the same key."""
+    merged = {}
+    old = CAL_STORE.parent.parent / "project-maya" / "calibration.json"
+    for path in (old, CAL_STORE):
+        try:
+            merged.update(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    return merged
+
+
+def saved_calibration(cfg: dict) -> dict | None:
+    """The settings an earlier tuning found for this PC, model and context, if any (CUDA only, as the tuning)."""
+    if cfg.get("backend") == "hip":
+        return None
+    return load_calibrations().get(hardware_key(cfg))
+
+
+def busy_gpus(cfg: dict) -> list:
+    """The config's GPUs with more than 1 GiB of VRAM in use (another engine on them): [(index, MiB)]."""
+    try:
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    used = {}
+    for line in txt.splitlines():
+        i, _, m = line.partition(",")
+        try:
+            used[int(i)] = int(float(m))
+        except ValueError:
+            pass
+    return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
+
+
+def calibrate_config(cfg_path: Path) -> bool:
+    """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
+    CAL_STORE for this PC, model and context (a setup again applies it)."""
+    cfg = read_json(cfg_path)
+    if cfg.get("backend") == "hip":
+        warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
+        return False
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             " (a model server still running?) - stop it, then run ./n1os.sh --calibrate")
+        return False
+    say()
+    say("  Tuning n1os for this PC: the output speed is measured with a few splits of the work between the CPU and")
+    say("  the PCIe link, and with fewer CPU threads. It takes about 10-15 minutes (the model loads first); the PC is")
+    say("  busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CAL.run(cfg, say=say)
+    except Exception as e:                             # never stops a setup: the engine's own choices stay
+        warn(f"the tuning did not finish ({e}): the engine's own settings stay")
+        why = CAL.engine_error(log, since)
+        if why:
+            say(f"       the engine said: {why}")
+        return False
+    env = CAL.apply(cfg.get("env") or {}, res["settings"])
+    if env:
+        cfg["env"] = env
+    else:
+        cfg.pop("env", None)
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    store = load_calibrations()
+    store[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
+                                "date": time.strftime("%Y-%m-%d")}
+    try:
+        CAL_STORE.parent.mkdir(parents=True, exist_ok=True)
+        CAL_STORE.write_text(json.dumps(store, indent=1), encoding="utf-8")
+    except OSError as e:
+        warn(f"could not save {CAL_STORE} ({e}): {cfg_path.name} has the settings, a setup again does not")
+    speed = f" ({res['report']['tok_s']} tok/s)" if res["report"].get("tok_s") else ""
+    if res["settings"]:
+        ok("tuned for this PC: " + ", ".join(f"{k}={v}" for k, v in res["settings"].items()) + speed)
+    else:
+        ok("tuned for this PC: the engine's own settings are already the fastest here" + speed)
+    return True
+
+
+def start(cfg_path: Path, a) -> int:
+    cfg = read_json(cfg_path)
+    select_build_backend(cfg.get("backend", "cuda"))
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
+                    (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
+        if p is None or not p.exists():
+            fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
+    cfg_path.touch()                                   # the most recently used model
+    refresh_engine(cfg)
+    port = a.port or cfg.get("port") or 8080
+    host = a.host or cfg.get("host") or "127.0.0.1"
+    key = a.api_key or cfg.get("api_key")
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+           "--port", str(port)]
+    if a.host:
+        cmd += ["--host", a.host]
+    if a.api_key:
+        cmd += ["--api-key", a.api_key]
+    if a.gpus or a.gpu is not None:                    # this start only, on these cards
+        cmd += ["--gpu", str(a.gpus or a.gpu)]
+    if WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        cmd.append("--open")                           # a desktop: the browser opens when the model is ready
+    here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    say()
+    say("  " + "-" * 100)
+    say(f"  Starting {cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
+    say(f"  Dashboard:        http://{here}:{port}/")
+    say(f"  API (OpenAI):     http://{here}:{port}/v1        (any model name; the API key: "
+        + ("the one you set)" if key else "any)"))
+    say(f"  API (Anthropic):  http://{here}:{port}/v1/messages")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        say("  Other devices:    the server prints this machine's addresses when it is ready" +
+            ("" if key else " - WARNING: no API key, anyone on your network can use it (--api-key KEY)"))
+    say("  Loading takes a few minutes: the engine pins up to all but about 6 GB of the free RAM for its expert tier")
+    say("  (STRATA_GLM_RAM_HEADROOM_GB changes the 6) and warms its caches - the first answers are the slowest.")
+    say("  Ctrl+C (or closing this terminal) stops it. Engine log: " + str(cfg.get("log", "")))
+    say("  " + "-" * 100)
+    return subprocess.call(cmd)
+
+
+# ------------------------------------------------------------------------------------------------ the report
+# the engine log's lines that tell where the time goes: how the model was split across VRAM / RAM / the SSD, the
+# prompt path's chunks, and the per-token breakdown ("glm stat": VRAM hits, RAM fetches, disk reads, CPU lane)
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|failed|"
+                          r"out of memory", re.I)
+STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
+
+
+def speed_lines(text) -> list:
+    """The log lines REPORT_LINES picks.  A request that only read a prompt (one token out) has no decode to report:
+    its "glm stat" line keeps only the prompt part, not a meaningless decode speed (96,000 tokens/s, issue #8)."""
+    picked = []
+    for x in text:
+        if not REPORT_LINES.search(x) or "warming the expert tiers" in x:
+            continue
+        m = STAT_DECODE.search(x)   # no decode: under 1 ms a token, or no expert touched (one prompt token out)
+        if m and (float(m.group(1)) < 1.0 or "vram hit 0.00%" in x) and "| prompt " in x:
+            x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
+        picked.append(x.strip())
+    return picked
+
+
+def hip_gpu_report(rocm: Path) -> str:
+    """Static AMD details, with KFD's HIP indices/architectures even when no SMI tool is installed.
+
+    Keep the SMI JSON in its own device order: its DRM indices need not match KFD's HIP indices.
+    This also retains driver/VRAM fields across the different versions of the two tools.
+    """
+    import platform
+    gpus = S.amd_gpus()
+    lines = ["KFD topology (HIP GPU indices):"]
+    lines += [f"{gpu_label(g)}; driver {g.get('driver', 'amdgpu')}" for g in gpus]
+    if not gpus:
+        lines.append("no AMD GPUs found in KFD topology")
+    try:
+        driver = Path("/sys/module/amdgpu/version").read_text().strip()
+    except OSError:
+        driver = ""
+    lines.append(f"amdgpu driver: {driver or 'in-tree'}, kernel {platform.release()}")
+    for name, args in (("rocm-smi", ["--showproductname", "--showmeminfo", "vram", "--showdriverversion", "--json"]),
+                       ("amd-smi", ["static", "--json"])):
+        exe = shutil.which(name)
+        if not exe and (rocm / "bin" / name).is_file():
+            exe = str(rocm / "bin" / name)
+        if not exe:
+            continue
+        try:
+            data = json.loads(S.out([exe, *args]))
+        except ValueError:
+            continue
+        if isinstance(data, (dict, list)) and data:
+            lines += [f"\n{name} (tool GPU indices):", json.dumps(data, indent=2)]
+            break
+    else:
+        lines.append("rocm-smi / amd-smi unavailable or did not answer; using KFD topology")
+    return "\n".join(lines)
+
+
+def rocm_report(rocm: Path) -> str:
+    """ROCm's install version file first, then hipcc; reporting never requires the compiler."""
+    version = ""
+    for name in ("version", "version-dev"):
+        try:
+            version = (rocm / ".info" / name).read_text().strip()
+        except OSError:
+            continue
+        if version:
+            break
+    if not version:
+        hipcc = rocm / "bin/hipcc"
+        if hipcc.is_file():
+            version = S.out([str(hipcc), "--version"]).strip()
+    return f"path {rocm}\nversion {version or 'unknown (ROCm version file / hipcc unavailable)'}"
+
+
+def report(version: str, backend: str | None = None, cfg_path: Path | None = None) -> int:
+    """--report: n1os-report.txt in the n1os folder - this PC, the installed setup and the engine log's speed lines,
+    for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are left out."""
+    home = str(Path.home())
+    lines = []
+    have = [cfg_path] if cfg_path is not None else configs()
+    cfg = {}
+    for p in have:
+        candidate = read_json(p)
+        if backend is None or candidate.get("backend", "cuda") == backend:
+            cfg = candidate
+            break
+    backend = backend or cfg.get("backend", "cuda")
+    select_build_backend(backend)
+    stamp = read_json(STAMP)
+
+    def add(title, text=""):
+        lines.append(f"## {title}")
+        lines.extend(str(text).rstrip().replace(home, "~").splitlines() or ["(nothing)"])
+        lines.append("")
+
+    git = S.out(["git", "-C", str(ROOT), "log", "-1", "--format=%h %cd", "--date=short"]).strip()
+    add("n1os", f"version {version}, commit {git or '?'}, Python {sys.version.split()[0]}, "
+                f"{sys.platform}{' (WSL)' if S.is_wsl() else ''}")
+    import platform
+    add("System", f"{platform.platform()}")
+    if backend == "hip":
+        rocm = Path((cfg.get("env") or {}).get("ROCM_PATH") or os.environ.get("ROCM_PATH")
+                    or stamp.get("rocm") or "/opt/rocm").expanduser().resolve()
+        add("GPUs", hip_gpu_report(rocm))
+        add("ROCm", rocm_report(rocm))
+    else:
+        add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
+                                         "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
+                                         "temperature.gpu", "--format=csv"]) or "nvidia-smi did not answer")
+    cpu, avx2, avx512 = S.cpu_info()
+    total, avail = mem_gb()
+    pf = S.page_file_gb()
+    add("CPU and RAM", f"{cpu}, {os.cpu_count()} threads, {'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'}\n"
+                       f"RAM {total:.1f} GB, {avail:.1f} GB available now" +
+                       (f", page file {pf:.0f} GB" if pf is not None else ""))
+    if WIN:
+        disks = S.out(["powershell", "-NoProfile", "-Command", "Get-PhysicalDisk | Format-Table -AutoSize "
+                                                              "FriendlyName,MediaType,BusType,Size | Out-String -Width 200"])
+    else:
+        disks = S.out(["lsblk", "-d", "-o", "NAME,MODEL,ROTA,TRAN,SIZE"])
+    add("Disks", disks)
+    keys = ("backend", "archs", "rocm", "date") if backend == "hip" else ("archs", "nvcc", "host_compiler", "date")
+    add("Engine build", json.dumps({k: stamp.get(k) for k in keys})
+        if stamp else "not compiled yet")
+    if not have:
+        add("Setup", f"no n1os-*.json yet: {ME} has not finished a setup here")
+    for c in have:
+        cfg = read_json(c)
+        args = cfg.get("args") or []
+        pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+        ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else "?"
+        d = pack.parent if pack else None
+        where = ""
+        if d is not None and d.exists():
+            gb = sum(p.stat().st_size for p in d.glob("*.gguf")) / 1e9
+            where = (f"\nmodel folder {d}: {gb:.1f} GB of GGUF, {shutil.disk_usage(d).free / 1e9:.0f} GB free, "
+                     f"{'a spinning hard disk' if rotational(d) else 'not a hard disk'}")
+        add(f"Setup {c.name}", f"model {(cfg.get('installer') or {}).get('quant', '?')}, context {ctx}, "
+                               f"GPUs {cfg.get('gpu')}, images {'on' if cfg.get('vision') else 'off'}, "
+                               f"settings {json.dumps(cfg.get('env') or {})}" + where)
+        log = Path(cfg.get("log") or c.with_suffix(".log"))
+        if log.exists():
+            text = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            picked = speed_lines(text)
+            add(f"Engine log {log.name}: the speed and memory lines (last 80 of {len(picked)})", "\n".join(picked[-80:]))
+            add(f"Engine log {log.name}: the last 25 lines", "\n".join(text[-25:]))
+        else:
+            add(f"Engine log {log.name}", "not written yet (start n1os once and ask it something)")
+    bench_txt = ROOT / "n1os-bench.txt"
+    if bench_txt.exists():
+        add("Benchmark (n1os-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
+    out = ROOT / "n1os-report.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    say()
+    ok(f"written: {out}")
+    say("  Attach this file to your report (GitHub issue, X, or wherever you are asking). It has this PC's hardware,")
+    say("  your n1os setup and the engine's speed lines - no API key, and your home folder is shown as ~.")
+    say("  Best: run it right after a slow answer, so the log has that answer's numbers.")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ the benchmark
+# the same three questions on every machine (greedy, thinking off), after one warm-up answer, so speeds compare
+BENCH_TOPICS = [
+    "Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring.",
+    "Explain how photosynthesis works, step by step, for a high-school student.",
+    "Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript.",
+]
+
+
+def bench(cfg_path: Path, version: str) -> int:
+    """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
+    questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
+    way the dashboard starts it.  Writes n1os-bench.txt (--report includes it).  A few minutes."""
+    import urllib.request
+    cfg = read_json(cfg_path)
+    select_build_backend(cfg.get("backend", "cuda"))
+    if cfg.get("backend") == "hip":
+        cfg["exe"] = str(EXE)
+    port = cfg.get("port") or 8080
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+        fail(f"n1os is running (port {port}): the benchmark needs the GPU memory it holds",
+             "stop it (Ctrl+C in its window), then run --bench again")
+    except OSError:
+        pass
+    sys.path.insert(0, str(ROOT))
+    import serve.server as SV                      # the server's own engine command and environment
+    import strata_tokenizer as ST
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+    tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
+    if not (tp / "vocab.json").exists():
+        fail(f"{cfg_path.name}: the tokenizer is missing ({tp})", f"run {ME} --setup to repair it")
+    tok = ST.Tokenizer.from_dir(tp)
+    ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
+    text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                       for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
+                       sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
+    doc = tok.encode(text)
+    lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
+    log_path = ROOT / "n1os-bench.log"
+    step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
+    t0 = time.time()
+    with open(log_path, "w", encoding="utf-8") as log:
+        p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
+                             cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
+
+        def gen(ids, n_new):
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            p.stdin.flush()
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    fail("the engine stopped during the benchmark", f"its log: {log_path}")
+                if line.startswith("DONE") or line.startswith("ERR"):
+                    return line.split()
+
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                fail("the engine stopped while loading", f"its log: {log_path}")
+            if line.startswith("READY"):
+                break
+        ok(f"loaded in {time.time() - t0:.0f} s")
+        chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+        gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
+        results = []
+        for q in BENCH_TOPICS:
+            f = gen(chat(q), 256)
+            if f[0] == "DONE" and float(f[4]) > 0:
+                results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
+                say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
+        if lens:                                            # warm-up: the first prompt after a start is slower
+            gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
+        for i, n in enumerate(lens):
+            f = gen(doc[i * 997:i * 997 + n], 1)            # different openings: nothing reused between them
+            if f[0] == "DONE" and float(f[3]) > 0:
+                results.append(("prefill", f"{n} tokens", n / float(f[3]) * 1000.0))
+                say(f"  prefill {results[-1][2]:6.0f} tokens/s   a {n}-token prompt")
+        p.stdin.write("QUIT\n")
+        p.stdin.flush()
+        try:
+            p.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    stats = speed_lines(log_path.read_text(encoding="utf-8", errors="replace").splitlines())
+    dec = [r[2] for r in results if r[0] == "decode"]
+    found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+    if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
+        by_index = {g["index"]: g for g in found}
+        found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
+    gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or "?"
+    total, _ = mem_gb()
+    lines = [f"n1os v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
+             f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
+             f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}",
+             f"decode (writing the answer): mean {sum(dec) / max(1, len(dec)):.1f} tokens/s over {len(dec)} answers of "
+             f"256 tokens (greedy, thinking off)"]
+    lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
+    lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
+    lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
+    out = ROOT / "n1os-bench.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    say()
+    for x in lines[:4 + len(results)]:
+        say("  " + x)
+    ok(f"written: {out} - attach it (with {ME} --report) to a speed report")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ main
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux)")
+    ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
+    ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
+    ap.add_argument("--yes", action="store_true",
+                    help="take the recommended answers (the model download still needs --download-model)")
+    ap.add_argument("--download-model", action="store_true",
+                    help="download the model without asking (the commands and the size are still printed)")
+    ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
+                                                          "recommended)")
+    ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
+                                                             "its 1.1 GB of files)")
+    ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
+                                       "or the .gguf file (the first one of a split model) when the folder holds "
+                                       "several models; it must be writable - the pack is written inside it "
+                                       "(without this option the setup lists the ones it finds in ~/models*)")
+    ap.add_argument("--models-dir", help="where downloaded models go, each in a folder named after it, e.g. "
+                                         "<DIR>/GSQ-RCO-3.5bit/ (default: n1os-data/models next to this folder); use "
+                                         "a fast NVMe SSD with ~100 GB free")
+    ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order)")
+    ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
+                                   "0,1,2,3")
+    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
+    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
+                                   "other devices on your network (set --api-key too)")
+    ap.add_argument("--api-key", help="require this key from API clients and the dashboard")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (README.md)")
+    ap.add_argument("--nvcc", help="the CUDA toolkit's nvcc to build with (default: the newest that fits your GPUs)")
+    ap.add_argument("--host-compiler", help="the C++ compiler nvcc uses, e.g. g++-12 (when the default g++ is newer "
+                                            "than your CUDA accepts)")
+    ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
+    ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--repack", action="store_true", help="build the pack again")
+    ap.add_argument("--report", action="store_true", help="write n1os-report.txt - this PC, the setup and the engine's "
+                                                          "speed lines - to attach when you report a problem or a "
+                                                          "speed (nothing is sent anywhere)")
+    ap.add_argument("--bench", action="store_true", help="a standard speed test of the installed model (a few "
+                                                         "minutes, with n1os stopped): decode on three questions and "
+                                                         "prefill at 2k / 8k tokens; writes n1os-bench.txt")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
+                         "then start the model (with --no-start: only tune)")
+    ap.add_argument("--config", type=Path, help="installed JSON config for --bench or --report "
+                                              "(default: most recently used)")
+    a = ap.parse_args()
+    if a.config is not None:
+        if not (a.bench or a.report):
+            ap.error("--config is used with --bench or --report")
+        if not a.config.is_file():
+            ap.error(f"config not found: {a.config}")
+        if a.backend and read_json(a.config).get("backend", "cuda") != a.backend:
+            ap.error(f"{a.config}: config backend does not match --backend {a.backend}")
+    if not WIN and sys.prefix == sys.base_prefix and not os.environ.get("N1OS_SH"):
+        # started as `python3 n1os.py`: a system Python takes no pip installs (PEP 668, "externally-managed-
+        # environment") - n1os.sh makes the private .venv and runs this file with its Python
+        say("Starting through ./n1os.sh, which runs n1os with its own Python environment (.venv) ...")
+        sys.stdout.flush()
+        os.execve("/bin/sh", ["/bin/sh", str(HERE / "n1os.sh"), *sys.argv[1:]], dict(os.environ, N1OS_SH="1"))
+    version = (HERE / "VERSION").read_text(encoding="utf-8").strip() if (HERE / "VERSION").exists() else "?"
+    say(f"n1os v{version} - fast inference for open models, on your own GPU(s). Built on Strata and Maya. "
+        "Launch hardware: RTX 3090 clusters; also the GPUs those engines already run.")
+    if a.report:
+        return report(version, a.backend, a.config)
+    if a.bench:
+        have = [a.config] if a.config is not None else configs()
+        if a.backend:
+            have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
+        if not have:
+            fail("n1os is not set up here yet", f"run {ME} first")
+        return bench(have[0], version)
+
+    have = configs()
+    if a.backend:
+        have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
+    else:
+        a.backend = "hip" if have and read_json(have[0]).get("backend") == "hip" else "cuda"
+    setting_up = a.setup or a.check or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
+    if have and not setting_up and (a.calibrate or not a.no_start):
+        pick = have[0]
+        if len(have) > 1:
+            say()
+            for i, c in enumerate(have, 1):
+                say(f"  {i}) {c.name}")
+            pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        if a.calibrate:
+            refresh_engine(read_json(pick))            # (the engine the tuning measures is the current one)
+            if not calibrate_config(pick):
+                say()
+                warn("this PC is NOT tuned (the reason is above): the model " +
+                     ("keeps" if a.no_start else "starts with") + " the engine's own settings")
+            if a.no_start:
+                return 0
+        return start(pick, a)
+    if not have and a.calibrate:
+        say("Nothing is set up yet: the setup runs first, then the tuning.")
+    prev = read_json(have[0]) if have else {}
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+
+    pc = check_pc(a)                                   # 1
+    plan = gpu_plan(pc["gpus"], mem_gb()[0])
+    say()
+    say(f"  {plan['summary']}")
+    if a.check:
+        say()
+        if a.backend == "hip":
+            pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) == 2
+                    else f"--gpu {pc['gpus'][0]['index']}")
+            say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")
+        else:
+            say(f"This PC can run n1os. Run {ME} without --check to set it up.")
+        return 0
+    step(2, "your choices")                            # 2
+    ctx = choose_context(a, prev_ctx, plan)
+    ok(f"context: {ctx} tokens")
+    # the models folder: --models-dir, else the one set up before (a config from before the option has its data
+    # folder, whose models/ held the downloads), else n1os-data/models next to this folder
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else
+              Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "n1os-data" / "models")
+    choice = choose_model(a, models, inst, plan)
+    if choice[0] == "download":
+        ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
+    else:
+        ok(f"model: {choice[1]} (yours)")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama)                    # 4
+    got = model_step(a, models, choice)                # 5
+    if got is None:
+        return 0
+    d, shards, quant = got
+    pack = pack_step(a, d, shards, llama)              # 6
+    vision = vision_step(a, pc, meta, llama, d, quant)  # 7
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice)   # 8
+    # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
+    # answers (--yes and --no-start setups are not held up by it)
+    tuned = None
+    cfg = read_json(cfg_path)
+    offer = cfg.get("backend") != "hip" and saved_calibration(cfg) is None and not a.yes and not a.no_start
+    if a.calibrate or (offer and ask(
+            "Tune n1os for this PC now? It measures the split of the work between the CPU and the PCIe link and the "
+            "CPU threads (about 10-15 minutes; later: ./n1os.sh --calibrate)", ["y", "n"], "y", a.yes) == "y"):
+        tuned = calibrate_config(cfg_path)
+    if tuned is False:
+        say()
+        warn("this PC is NOT tuned (the reason is above): ./n1os.sh --calibrate tries again")
+    if a.no_start:
+        say()
+        say(f"All set. Start it with {ME} (or " + (f"run-{cfg_path.stem}.bat" if WIN else f"./run-{cfg_path.stem}.sh")
+            + ").")
+        return 0
+    return start(cfg_path, a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say("\nstopped.")
+        sys.exit(1)
