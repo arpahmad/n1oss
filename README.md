@@ -1,12 +1,11 @@
 <h1 align="center">n1os</h1>
 
-<p align="center"><b>Fast inference for the latest open-source models</b><br>
-A model-agnostic engine based on Strata and Maya · RTX 3090 clusters at launch · Linux, Windows (experimental) · chat in the browser, OpenAI- and
-Anthropic-compatible API</p>
+<p align="center"><b>Optimized inference engine for the latest open models</b><br>
+GLM-5.3-Flash and Qwen 3.8-Flash-Next · built on Strata and Maya · RTX 3090 clusters</p>
 
 <p align="center"><a href="https://buymeacoffee.com/peasantsmith">☕ Support n1os - buy me a coffee</a></p>
 
-n1os serves strong open-source LLMs on your own GPUs. It is not a runner built for one family. The engine is
+n1os runs the latest large open models on your own GPUs. The engine is
 [Strata](https://github.com/Niko1221/Strata) (MIT) plus the Maya work on top of it: expert tiers across VRAM, RAM
 and SSD, a layer split across up to 16 GPUs, and speculative decoding where the model has a draft block. Nothing
 leaves your machine.
@@ -17,7 +16,7 @@ the GPUs Strata and the GLM path already support: NVIDIA compute capability 7.0 
 up to 16 cards), and experimental AMD (RX 7900 XT / XTX, R9700 / RX 9070, Strix Halo).
 
 The first family it serves is **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (zai-org, MIT): 321 B
-parameters, about 18 B active on each token, context up to 1 M. Qwen stays in the engine as the Strata path. The
+parameters, about 18 B active on each token, context up to 1 M. Qwen 3.8-Flash-Next is in the engine on the Strata path; the installer serves GLM today. The
 next open models register in the same installer (`FAMILIES` in `n1os.py`).
 
 **AMD (experimental):** Linux on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo (Radeon 8060S), one GPU or two (Strix Halo: one), text only - see
